@@ -11,15 +11,37 @@ const COOKIES_PATH = '/tmp/cookies.txt';
 let cookiesLoaded = false;
 
 function initCookies() {
-  if (process.env.COOKIES_DATA) {
+  if (!process.env.COOKIES_DATA) {
+    console.log('[INIT] No COOKIES_DATA env var set');
+    return;
+  }
+  try {
+    let raw = process.env.COOKIES_DATA;
     try {
-      fs.writeFileSync(COOKIES_PATH, process.env.COOKIES_DATA, { mode: 0o600 });
-      const stats = fs.statSync(COOKIES_PATH);
-      cookiesLoaded = stats.size > 1000;
-      console.log('[INIT] Cookies loaded:', cookiesLoaded ? 'yes' : 'no');
-    } catch (err) {
-      console.error('[INIT] Cookie error:', err.message);
+      const decoded = Buffer.from(raw, 'base64').toString('utf8');
+      if (decoded.includes('# Netscape HTTP Cookie File')) {
+        raw = decoded;
+        console.log('[INIT] Cookies decoded from base64');
+      }
+    } catch {}
+
+    raw = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+    fs.writeFileSync(COOKIES_PATH, raw, { mode: 0o600 });
+    const stats = fs.statSync(COOKIES_PATH);
+    const content = fs.readFileSync(COOKIES_PATH, 'utf8');
+
+    if (!content.includes('# Netscape HTTP Cookie File')) {
+      console.warn('[INIT] Cookie file missing Netscape header — cookies disabled');
+      cookiesLoaded = false;
+      return;
     }
+
+    cookiesLoaded = stats.size > 500;
+    console.log('[INIT] Cookies loaded:', cookiesLoaded ? `yes (${stats.size} bytes)` : 'no (too small)');
+  } catch (err) {
+    console.error('[INIT] Cookie error:', err.message);
+    cookiesLoaded = false;
   }
 }
 
@@ -123,12 +145,24 @@ app.post('/api/info', async (req, res) => {
     
     let formats = [];
     if (format === 'mp4') {
-      const vids = (info.formats || []).filter(f => f.ext === 'mp4' && f.filesize && f.height);
+      const vids = (info.formats || []).filter(f =>
+        (f.ext === 'mp4' || f.video_ext === 'mp4') &&
+        f.height &&
+        f.vcodec &&
+        f.vcodec !== 'none'
+      );
       const heights = [...new Set(vids.map(f => f.height))].sort((a, b) => b - a);
       console.log('[INFO] Heights:', heights.join(', '));
       formats = heights.slice(0, 6).map(h => {
         const f = vids.find(x => x.height === h);
-        return { formatId: f.format_id, quality: `${h}p`, ext: 'mp4', filesize: f.filesize, height: h };
+        return {
+          formatId: f.format_id,
+          quality: `${h}p`,
+          ext: 'mp4',
+          filesize: f.filesize || f.filesize_approx || null,
+          height: h,
+          needsMerge: !f.acodec || f.acodec === 'none'
+        };
       });
     } else if (format === 'mp3' || format === 'wav') {
       formats = [
@@ -151,12 +185,12 @@ app.post('/api/info', async (req, res) => {
   }
 });
 
-function buildMp4Attempts(url, out) {
+function buildMp4Attempts(url, out, formatId) {
   return [
+    ['-f', `${formatId}+bestaudio/best[ext=mp4]/best`, '--merge-output-format', 'mp4', '--prefer-ffmpeg', '-o', out, '--geo-bypass', url],
+    ['-f', 'bestvideo[ext=mp4]+bestaudio/best[ext=mp4]', '--merge-output-format', 'mp4', '--prefer-ffmpeg', '-o', out, '--geo-bypass', url],
     ['-f', 'best[ext=mp4]/best', '--prefer-ffmpeg', '-o', out, '--geo-bypass', url],
-    ['-f', 'bestvideo+bestaudio/best', '--merge-output-format', 'mp4', '--prefer-ffmpeg', '-o', out, '--geo-bypass', url],
     ['-f', 'best', '--prefer-ffmpeg', '-o', out, '--geo-bypass', url],
-    ['-f', 'bestvideo+bestaudio', '--prefer-ffmpeg', '-o', out, '--geo-bypass', url]
   ];
 }
 
@@ -191,14 +225,28 @@ app.post('/api/download', async (req, res) => {
       console.log('[DL] Attempt', i + 1, attempts[i].slice(0, 3).join(' '));
       try {
         await execYtDlp(attempts[i], 300000);
-        const f = path.join(tmp, `v2x_${id}.${finalExt}`);
-        if (fs.existsSync(f)) { finalPath = f; break; }
-        const files = fs.readdirSync(tmp).filter(f => f.startsWith(`v2x_${id}`));
-        if (files.length) {
-          finalPath = path.join(tmp, files[0]);
-          finalExt = files[0].match(/\.(\w+)$/)?.[1] || finalExt;
-          break;
+
+        const expectedPath = path.join(tmp, `v2x_${id}.${finalExt}`);
+        let resolved = false;
+        for (let w = 0; w < 10; w++) {
+          await new Promise(r => setTimeout(r, 300));
+          if (fs.existsSync(expectedPath) && fs.statSync(expectedPath).size > 0) {
+            finalPath = expectedPath;
+            resolved = true;
+            break;
+          }
+          const files = fs.readdirSync(tmp).filter(f => f.startsWith(`v2x_${id}`));
+          if (files.length) {
+            const candidate = path.join(tmp, files[0]);
+            if (fs.statSync(candidate).size > 0) {
+              finalPath = candidate;
+              finalExt = files[0].match(/\.(\w+)$/)?.[1] || finalExt;
+              resolved = true;
+              break;
+            }
+          }
         }
+        if (resolved) break;
       } catch (e) {
         lastError = e;
         console.log('[DL] Failed:', e.type, e.message);
@@ -214,7 +262,7 @@ app.post('/api/download', async (req, res) => {
       await download(buildAudioAttempts(url, out, ext, qual));
       finalExt = ext;
     } else {
-      await download(buildMp4Attempts(url, out));
+      await download(buildMp4Attempts(url, out, formatId));
     }
     
     const stat = fs.statSync(finalPath);
@@ -229,11 +277,19 @@ app.post('/api/download', async (req, res) => {
     stream.pipe(res);
   } catch (e) {
     console.error('[DL] Error:', e.message);
+
+    try {
+      const leftover = fs.readdirSync(os.tmpdir()).filter(f => f.startsWith(`v2x_${id}`));
+      for (const f of leftover) {
+        fs.unlinkSync(path.join(os.tmpdir(), f));
+      }
+    } catch {}
+
     res.status(500).json({ error: e.type === 'BOT' ? e.message : 'Download failed' });
   }
 });
 
-app.use((err, req, res) => {
+app.use((err, req, res, next) => {
   console.error('[SERVER] Error:', err);
   res.status(500).json({ error: 'Server error' });
 });

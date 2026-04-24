@@ -1,4 +1,4 @@
-FROM node:18-slim
+FROM node:18.20.4-slim
 
 RUN apt-get update && apt-get install -y \
     curl \
@@ -20,8 +20,9 @@ RUN npm install --omit=dev
 
 COPY . .
 
-RUN if [ -f cookies.txt ]; then cp cookies.txt /app/cookies.txt; fi
+RUN useradd -m -u 1001 appuser && chown -R appuser:appuser /app
+USER appuser
 
 EXPOSE 3000
 
-CMD ["node", "server.js"]
+CMD ["sh", "-c", "yt-dlp -U --no-update-info 2>/dev/null || true && node server.js"]
