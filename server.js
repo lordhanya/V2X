@@ -8,18 +8,36 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const COOKIES_PATH = '/tmp/cookies.txt';
 
-const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0'
+];
+
+function getRandomUserAgent() {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
 const REFERER = 'https://www.youtube.com/';
 const ORIGIN = 'https://www.youtube.com';
+
+let cookiesLoaded = false;
 
 function initCookies() {
   if (process.env.COOKIES_DATA) {
     try {
       fs.writeFileSync(COOKIES_PATH, process.env.COOKIES_DATA, { mode: 0o600 });
-      console.log('[INIT] Cookies loaded from environment');
+      const stats = fs.statSync(COOKIES_PATH);
+      if (stats.size > 1000) {
+        cookiesLoaded = true;
+        console.log('[INIT] Cookies loaded from environment (' + stats.size + ' bytes)');
+      }
     } catch (err) {
       console.error('[INIT] Failed to load cookies:', err.message);
     }
+  } else {
+    console.log('[INIT] No COOKIES_DATA environment variable set');
   }
 }
 
@@ -29,21 +47,16 @@ app.use(express.json());
 app.use(express.static('public'));
 
 function cookiesEnabled() {
-  try {
-    if (!fs.existsSync(COOKIES_PATH)) return false;
-    const stats = fs.statSync(COOKIES_PATH);
-    return stats.size > 1000;
-  } catch {
-    return false;
-  }
+  return cookiesLoaded;
 }
 
-function getYtDlpArgs(baseArgs) {
+function getYtDlpArgs(baseArgs, rotateUa = false) {
+  const ua = rotateUa ? getRandomUserAgent() : USER_AGENTS[0];
+  
   const commonFlags = [
-    '--user-agent', USER_AGENT,
+    '--user-agent', ua,
     '--add-header', `Referer:${REFERER}`,
     '--add-header', `Origin:${ORIGIN}`,
-    '--force-ipv4',
     '--no-playlist',
     '--no-warnings'
   ];
@@ -94,8 +107,8 @@ function sanitizeUrl(url) {
   return youtubePatterns.some(pattern => pattern.test(url));
 }
 
-function execYtDlp(args, timeout = 120000) {
-  const ytArgs = getYtDlpArgs(args);
+function execYtDlp(args, timeout = 120000, rotateUa = false) {
+  const ytArgs = getYtDlpArgs(args, rotateUa);
   
   return new Promise((resolve, reject) => {
     const proc = spawn('yt-dlp', ytArgs, {
@@ -179,7 +192,7 @@ app.post('/api/info', async (req, res) => {
       '--no-warnings',
       '--geo-bypass',
       url
-    ]);
+    ], 30000, true);
     
     const info = JSON.parse(output.trim());
     
@@ -295,7 +308,11 @@ app.post('/api/download', async (req, res) => {
           lastError = err;
           console.log(`[DOWNLOAD] Attempt ${i + 1} failed (${err.type}):`, err.message);
           
-          if (err.type === 'AUTH') throw err;
+          if (err.type === 'BOT' && i < attempts.length - 1) {
+            console.log('[DOWNLOAD] Bot detected, retrying with rotated User-Agent...');
+            continue;
+          }
+          
           if (err.type === 'FFMPEG') throw err;
         }
       }
