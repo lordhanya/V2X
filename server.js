@@ -86,9 +86,11 @@ function execYtDlp(args, timeout = 120000) {
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let killed = false;
     
     const timer = setTimeout(() => {
       timedOut = true;
+      killed = true;
       proc.kill('SIGKILL');
       reject(new Error('Process timed out'));
     }, timeout);
@@ -103,21 +105,27 @@ function execYtDlp(args, timeout = 120000) {
     
     proc.on('close', (code) => {
       clearTimeout(timer);
-      if (timedOut) return;
+      if (timedOut || killed) return;
       
       if (code === 0) {
         resolve(stdout);
       } else {
         const errorMsg = stderr.trim();
         
-        if (errorMsg.includes('Sign in to confirm') || errorMsg.includes('bot')) {
+        if (errorMsg.includes('Sign in to confirm') || errorMsg.includes('bot') || errorMsg.includes('HTTP Error 403')) {
           if (cookiesEnabled()) {
-            reject(new Error('YouTube blocked request. Try updating cookies.txt with fresh session cookies.'));
+            reject(new Error('YouTube blocked request. Try updating cookies with fresh session.'));
           } else {
-            reject(new Error('YouTube blocked request. Please add cookies.txt file for authentication.'));
+            reject(new Error('YouTube blocked request. Add cookies for authentication.'));
           }
+        } else if (errorMsg.includes('Requested format is not available') || errorMsg.includes('no format')) {
+          reject(new Error('Format not available. Trying best quality...'));
+        } else if (errorMsg.includes('ffmpeg') && errorMsg.includes('not found')) {
+          reject(new Error('FFmpeg not available. Please install ffmpeg.'));
+        } else if (errorMsg) {
+          reject(new Error(errorMsg));
         } else {
-          reject(new Error(errorMsg || `Process exited with code ${code}`));
+          reject(new Error(`Process exited with code ${code}`));
         }
       }
     });
@@ -237,7 +245,6 @@ app.post('/api/download', async (req, res) => {
     const outputTemplate = path.join(tempDir, `v2x_${uniqueId}.%(ext)s`);
     
     let finalExt = ext || 'mp4';
-    let lastError = null;
     
     async function tryDownload(args, timeout) {
       await execYtDlp(args, timeout);
@@ -254,63 +261,50 @@ app.post('/api/download', async (req, res) => {
       return actualFile;
     }
     
-    if (ext === 'mp3') {
+    let finalPath;
+    
+    if (ext === 'mp3' || ext === 'wav') {
+      const audioFormat = ext;
       const audioQual = formatId === '320' ? '0' : formatId === '128' ? '5' : '9';
+      
       const args = [
         '-x',
-        '--audio-format', 'mp3',
+        '--audio-format', audioFormat,
         '--audio-quality', audioQual,
+        '--prefer-ffmpeg',
         '-o', outputTemplate,
         '--no-playlist',
         '--no-warnings',
-        '--prefer-ffmpeg',
         url
       ];
-      finalExt = 'mp3';
       
       try {
-        var finalPath = await tryDownload(args, 300000);
+        finalPath = await tryDownload(args, 300000);
       } catch (err) {
-        lastError = err;
         const retryArgs = [
           '-x',
-          '--audio-format', 'mp3',
+          '--audio-format', audioFormat,
           '--audio-quality', '0',
+          '--prefer-ffmpeg',
           '-o', outputTemplate,
           '--no-playlist',
           '--no-warnings',
-          '--prefer-ffmpeg',
           url
         ];
-        finalPath = await tryDownload(retryArgs, 300000);
-      }
-    } else if (ext === 'wav') {
-      const args = [
-        '-x',
-        '--audio-format', 'wav',
-        '--audio-quality', '0',
-        '-o', outputTemplate,
-        '--no-playlist',
-        '--no-warnings',
-        '--prefer-ffmpeg',
-        url
-      ];
-      finalExt = 'wav';
-      
-      try {
-        var finalPath = await tryDownload(args, 300000);
-      } catch (err) {
-        lastError = err;
-        const retryArgs = [
-          '-x',
-          '--audio-format', 'wav',
-          '-o', outputTemplate,
-          '--no-playlist',
-          '--no-warnings',
-          '--prefer-ffmpeg',
-          url
-        ];
-        finalPath = await tryDownload(retryArgs, 300000);
+        try {
+          finalPath = await tryDownload(retryArgs, 300000);
+        } catch (retryErr) {
+          const bestArgs = [
+            '-f', 'bestaudio',
+            '--prefer-ffmpeg',
+            '-o', outputTemplate,
+            '--no-playlist',
+            '--no-warnings',
+            url
+          ];
+          finalExt = 'm4a';
+          finalPath = await tryDownload(bestArgs, 300000);
+        }
       }
     } else {
       const args = [
@@ -324,11 +318,11 @@ app.post('/api/download', async (req, res) => {
       ];
       
       try {
-        var finalPath = await tryDownload(args, 300000);
+        finalPath = await tryDownload(args, 300000);
       } catch (err) {
-        lastError = err;
         const retryArgs = [
           '-f', 'best',
+          '--prefer-ffmpeg',
           '-o', outputTemplate,
           '--no-playlist',
           '--no-warnings',
@@ -337,10 +331,19 @@ app.post('/api/download', async (req, res) => {
         try {
           finalPath = await tryDownload(retryArgs, 300000);
         } catch (retryErr) {
-          finalPath = await tryDownload(['-f', 'best', '-o', outputTemplate, '--no-playlist', url], 300000);
+          const bestVideoArgs = [
+            '-f', 'bestvideo+bestaudio',
+            '--prefer-ffmpeg',
+            '-o', outputTemplate,
+            '--no-playlist',
+            '--no-warnings',
+            url
+          ];
+          finalPath = await tryDownload(bestVideoArgs, 300000);
         }
       }
     }
+    
     const stat = fs.statSync(finalPath);
     const filename = path.basename(finalPath);
     
