@@ -13,3 +13,4 @@ tmp/
 temp/
 *.tmp
 .cache/
+cookies.txt

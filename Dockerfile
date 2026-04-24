@@ -20,6 +20,8 @@ RUN npm install --omit=dev
 
 COPY . .
 
+RUN if [ -f cookies.txt ]; then cp cookies.txt /app/cookies.txt; fi
+
 EXPOSE 3000
 
 CMD ["node", "server.js"]

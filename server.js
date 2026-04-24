@@ -6,9 +6,21 @@ const os = require('os');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const COOKIES_PATH = path.join(__dirname, 'cookies.txt');
 
 app.use(express.json());
 app.use(express.static('public'));
+
+function cookiesEnabled() {
+  return fs.existsSync(COOKIES_PATH);
+}
+
+function getYtDlpArgs(baseArgs) {
+  if (cookiesEnabled()) {
+    return [...baseArgs, '--cookies', COOKIES_PATH];
+  }
+  return baseArgs;
+}
 
 const requestCounts = new Map();
 const RATE_LIMIT_WINDOW = 60 * 1000;
@@ -51,8 +63,10 @@ function sanitizeUrl(url) {
 }
 
 function execYtDlp(args, timeout = 120000) {
+  const ytArgs = getYtDlpArgs(args);
+  
   return new Promise((resolve, reject) => {
-    const proc = spawn('yt-dlp', args, {
+    const proc = spawn('yt-dlp', ytArgs, {
       stdio: ['ignore', 'pipe', 'pipe']
     });
     
@@ -81,8 +95,17 @@ function execYtDlp(args, timeout = 120000) {
       if (code === 0) {
         resolve(stdout);
       } else {
-        const errorMsg = stderr.trim() || `Process exited with code ${code}`;
-        reject(new Error(errorMsg));
+        const errorMsg = stderr.trim();
+        
+        if (errorMsg.includes('Sign in to confirm') || errorMsg.includes('bot')) {
+          if (cookiesEnabled()) {
+            reject(new Error('YouTube blocked request. Try updating cookies.txt with fresh session cookies.'));
+          } else {
+            reject(new Error('YouTube blocked request. Please add cookies.txt file for authentication.'));
+          }
+        } else {
+          reject(new Error(errorMsg || `Process exited with code ${code}`));
+        }
       }
     });
     
