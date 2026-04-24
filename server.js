@@ -8,20 +8,6 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const COOKIES_PATH = '/tmp/cookies.txt';
 
-const USER_AGENTS = [
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0'
-];
-
-function getRandomUserAgent() {
-  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-}
-
-const REFERER = 'https://www.youtube.com/';
-const ORIGIN = 'https://www.youtube.com';
-
 let cookiesLoaded = false;
 
 function initCookies() {
@@ -29,15 +15,11 @@ function initCookies() {
     try {
       fs.writeFileSync(COOKIES_PATH, process.env.COOKIES_DATA, { mode: 0o600 });
       const stats = fs.statSync(COOKIES_PATH);
-      if (stats.size > 1000) {
-        cookiesLoaded = true;
-        console.log('[INIT] Cookies loaded from environment (' + stats.size + ' bytes)');
-      }
+      cookiesLoaded = stats.size > 1000;
+      console.log('[INIT] Cookies loaded:', cookiesLoaded ? 'yes' : 'no');
     } catch (err) {
-      console.error('[INIT] Failed to load cookies:', err.message);
+      console.error('[INIT] Cookie error:', err.message);
     }
-  } else {
-    console.log('[INIT] No COOKIES_DATA environment variable set');
   }
 }
 
@@ -46,25 +28,11 @@ initCookies();
 app.use(express.json());
 app.use(express.static('public'));
 
-function cookiesEnabled() {
-  return cookiesLoaded;
-}
-
-function getYtDlpArgs(baseArgs, rotateUa = false) {
-  const ua = rotateUa ? getRandomUserAgent() : USER_AGENTS[0];
-  
-  const commonFlags = [
-    '--user-agent', ua,
-    '--add-header', `Referer:${REFERER}`,
-    '--add-header', `Origin:${ORIGIN}`,
-    '--no-playlist',
-    '--no-warnings'
-  ];
-  
-  if (cookiesEnabled()) {
-    return [...baseArgs, '--cookies', COOKIES_PATH, ...commonFlags];
+function getYtDlpArgs(baseArgs) {
+  if (cookiesLoaded) {
+    return [...baseArgs, '--cookies', COOKIES_PATH, '--no-playlist', '--no-warnings'];
   }
-  return [...baseArgs, ...commonFlags];
+  return [...baseArgs, '--no-playlist', '--no-warnings'];
 }
 
 const requestCounts = new Map();
@@ -83,42 +51,25 @@ setInterval(() => {
 function checkRateLimit(ip) {
   const now = Date.now();
   let record = requestCounts.get(ip);
-  
   if (!record || now - record.resetTime > RATE_LIMIT_WINDOW) {
     requestCounts.set(ip, { count: 1, resetTime: now });
     return true;
   }
-  
-  if (record.count >= MAX_REQUESTS) {
-    return false;
-  }
-  
+  if (record.count >= MAX_REQUESTS) return false;
   record.count++;
   return true;
 }
 
 function sanitizeUrl(url) {
-  const youtubePatterns = [
-    /^https?:\/\/(www\.)?youtube\.com\/watch\?v=[\w-]+/,
-    /^https?:\/\/(www\.)?youtube\.com\/shorts\/[\w-]+/,
-    /^https?:\/\/youtu\.be\/[\w-]+/
-  ];
-  
-  return youtubePatterns.some(pattern => pattern.test(url));
+  return /^https?:\/\/(www\.)?youtube\.com\/watch\?v=|^https?:\/\/(www\.)?youtube\.com\/shorts\/|^https?:\/\/youtu\.be\//.test(url);
 }
 
-function execYtDlp(args, timeout = 120000, rotateUa = false) {
-  const ytArgs = getYtDlpArgs(args, rotateUa);
-  
+function execYtDlp(args, timeout = 120000) {
+  const ytArgs = getYtDlpArgs(args);
   return new Promise((resolve, reject) => {
-    const proc = spawn('yt-dlp', ytArgs, {
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-    
-    let stdout = '';
-    let stderr = '';
-    let timedOut = false;
-    let killed = false;
+    const proc = spawn('yt-dlp', ytArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '';
+    let timedOut = false, killed = false;
     
     const timer = setTimeout(() => {
       timedOut = true;
@@ -127,40 +78,29 @@ function execYtDlp(args, timeout = 120000, rotateUa = false) {
       reject({ type: 'TIMEOUT', message: 'Process timed out' });
     }, timeout);
     
-    proc.stdout.on('data', (data) => {
-      stdout += data.toString();
-    });
+    proc.stdout.on('data', d => stdout += d.toString());
+    proc.stderr.on('data', d => stderr += d.toString());
     
-    proc.stderr.on('data', (data) => {
-      stderr += data.toString();
-    });
-    
-    proc.on('close', (code) => {
+    proc.on('close', code => {
       clearTimeout(timer);
       if (timedOut || killed) return;
-      
-      if (code === 0) {
-        resolve(stdout);
-      } else {
-        const errorMsg = stderr.trim();
-        
-        if (errorMsg.includes('Sign in to confirm') || errorMsg.includes('bot') || errorMsg.includes('HTTP Error 403') || errorMsg.includes('blocked')) {
-          reject({ type: 'BOT', message: 'YouTube is blocking server requests. Try again later.' });
-        } else if (errorMsg.includes('Requested format is not available') || errorMsg.includes('no format') || errorMsg.includes('no matching format')) {
+      if (code === 0) resolve(stdout);
+      else {
+        const err = stderr.trim();
+        if (err.includes('Sign in') || err.includes('bot') || err.includes('403') || err.includes('blocked')) {
+          const msg = cookiesLoaded ? 'Refresh cookies needed' : 'Cookies required';
+          reject({ type: 'BOT', message: msg });
+        } else if (err.includes('format')) {
           reject({ type: 'FORMAT', message: 'Format not available' });
-        } else if (errorMsg.includes('Unable to extract') || errorMsg.includes('network') || errorMsg.includes('Connection')) {
+        } else if (err.includes('network') || err.includes('Connection')) {
           reject({ type: 'NETWORK', message: 'Network error' });
-        } else if (errorMsg.includes('ffmpeg') && errorMsg.includes('not found')) {
-          reject({ type: 'FFMPEG', message: 'FFmpeg not available' });
-        } else if (errorMsg) {
-          reject({ type: 'OTHER', message: errorMsg });
         } else {
-          reject({ type: 'OTHER', message: `Process exited with code ${code}` });
+          reject({ type: 'OTHER', message: err || `Code ${code}` });
         }
       }
     });
     
-    proc.on('error', (err) => {
+    proc.on('error', err => {
       clearTimeout(timer);
       reject({ type: 'NETWORK', message: err.message });
     });
@@ -168,51 +108,27 @@ function execYtDlp(args, timeout = 120000, rotateUa = false) {
 }
 
 app.post('/api/info', async (req, res) => {
+  if (!checkRateLimit(req.ip || 'unknown')) {
+    return res.status(429).json({ error: 'Too many requests' });
+  }
+  
+  const { url, format } = req.body;
+  if (!url || !sanitizeUrl(url)) {
+    return res.status(400).json({ error: 'Invalid URL' });
+  }
+  
   try {
-    const clientIp = req.ip || req.connection?.remoteAddress || 'unknown';
-    
-    if (!checkRateLimit(clientIp)) {
-      return res.status(429).json({ error: 'Too many requests. Please try again later.' });
-    }
-    
-    const { url, format } = req.body;
-    
-    if (!url || typeof url !== 'string') {
-      return res.status(400).json({ error: 'URL is required' });
-    }
-    
-    if (!sanitizeUrl(url)) {
-      return res.status(400).json({ error: 'Invalid YouTube URL' });
-    }
-    
-    const output = await execYtDlp([
-      '--dump-single-json',
-      '--no-download',
-      '--no-playlist',
-      '--no-warnings',
-      '--geo-bypass',
-      url
-    ], 30000, true);
-    
-    const info = JSON.parse(output.trim());
+    const out = await execYtDlp(['--dump-single-json', '--no-download', '--geo-bypass', url]);
+    const info = JSON.parse(out.trim());
     
     let formats = [];
-    
     if (format === 'mp4') {
-      const videoFormats = (info.formats || []).filter(f => f.ext === 'mp4' && f.filesize && f.height && f.vcodec !== 'none');
-      const uniqueHeights = [...new Set(videoFormats.map(f => f.height))].sort((a, b) => b - a);
-      
-      console.log('[INFO] Available heights:', uniqueHeights.join(', '));
-      
-      formats = uniqueHeights.slice(0, 6).map(height => {
-        const f = videoFormats.find(x => x.height === height);
-        return {
-          formatId: f.format_id,
-          quality: `${height}p`,
-          ext: 'mp4',
-          filesize: f.filesize,
-          height: f.height
-        };
+      const vids = (info.formats || []).filter(f => f.ext === 'mp4' && f.filesize && f.height);
+      const heights = [...new Set(vids.map(f => f.height))].sort((a, b) => b - a);
+      console.log('[INFO] Heights:', heights.join(', '));
+      formats = heights.slice(0, 6).map(h => {
+        const f = vids.find(x => x.height === h);
+        return { formatId: f.format_id, quality: `${h}p`, ext: 'mp4', filesize: f.filesize, height: h };
       });
     } else if (format === 'mp3' || format === 'wav') {
       formats = [
@@ -225,160 +141,103 @@ app.post('/api/info', async (req, res) => {
     res.json({
       title: info.title,
       thumbnail: info.thumbnail,
-      uploader: info.uploader || info.channel || info.creator || 'Unknown',
+      uploader: info.uploader || info.channel || 'Unknown',
       duration: info.duration,
       formats
     });
-    
-  } catch (error) {
-    const err = error.type ? error : { type: 'OTHER', message: error.message };
-    console.error('[INFO] Error:', err.message);
-    res.status(500).json({ error: err.message || 'Failed to fetch video information' });
+  } catch (e) {
+    console.error('[INFO] Error:', e.message);
+    res.status(500).json({ error: e.type === 'BOT' ? e.message : 'Failed to fetch video info' });
   }
 });
 
-function buildMp4Attempts(url, outputPath) {
+function buildMp4Attempts(url, out) {
   return [
-    ['-f', 'best[ext=mp4]/best', '--prefer-ffmpeg', '-o', outputPath, '--no-playlist', '--no-warnings', '--geo-bypass', url],
-    ['-f', 'bestvideo+bestaudio/best', '--merge-output-format', 'mp4', '--remux-video', 'mp4', '--prefer-ffmpeg', '-o', outputPath, '--no-playlist', '--no-warnings', '--geo-bypass', url],
-    ['-f', 'best', '--prefer-ffmpeg', '-o', outputPath, '--no-playlist', '--no-warnings', '--geo-bypass', url],
-    ['-f', 'bestvideo+bestaudio', '--prefer-ffmpeg', '-o', outputPath, '--no-playlist', '--no-warnings', '--geo-bypass', url]
+    ['-f', 'best[ext=mp4]/best', '--prefer-ffmpeg', '-o', out, '--geo-bypass', url],
+    ['-f', 'bestvideo+bestaudio/best', '--merge-output-format', 'mp4', '--prefer-ffmpeg', '-o', out, '--geo-bypass', url],
+    ['-f', 'best', '--prefer-ffmpeg', '-o', out, '--geo-bypass', url],
+    ['-f', 'bestvideo+bestaudio', '--prefer-ffmpeg', '-o', out, '--geo-bypass', url]
   ];
 }
 
-function buildAudioAttempts(url, outputPath, audioFormat, audioQual) {
+function buildAudioAttempts(url, out, fmt, qual) {
   return [
-    ['-x', '--audio-format', audioFormat, '--audio-quality', audioQual, '--prefer-ffmpeg', '-o', outputPath, '--no-playlist', '--no-warnings', '--geo-bypass', url],
-    ['-x', '--audio-format', audioFormat, '--audio-quality', '0', '--prefer-ffmpeg', '-o', outputPath, '--no-playlist', '--no-warnings', '--geo-bypass', url],
-    ['-f', 'bestaudio', '--prefer-ffmpeg', '-o', outputPath.replace('%(ext)s', 'm4a'), '--no-playlist', '--no-warnings', '--geo-bypass', url],
-    ['-f', 'best', '--prefer-ffmpeg', '-o', outputPath.replace('%(ext)s', 'm4a'), '--no-playlist', '--no-warnings', '--geo-bypass', url]
+    ['-x', '--audio-format', fmt, '--audio-quality', qual, '--prefer-ffmpeg', '-o', out, '--geo-bypass', url],
+    ['-x', '--audio-format', fmt, '--audio-quality', '0', '--prefer-ffmpeg', '-o', out, '--geo-bypass', url],
+    ['-f', 'bestaudio', '--prefer-ffmpeg', '-o', out.replace('%(ext)s', 'm4a'), '--geo-bypass', url]
   ];
 }
 
 app.post('/api/download', async (req, res) => {
-  try {
-    const clientIp = req.ip || req.connection?.remoteAddress || 'unknown';
-    
-    if (!checkRateLimit(clientIp)) {
-      return res.status(429).json({ error: 'Too many requests. Please try again later.' });
-    }
-    
-    const { url, formatId, ext } = req.body;
-    
-    if (!url || !formatId) {
-      return res.status(400).json({ error: 'URL and format are required' });
-    }
-    
-    if (!sanitizeUrl(url)) {
-      return res.status(400).json({ error: 'Invalid YouTube URL' });
-    }
-    
-    const tempDir = os.tmpdir();
-    const uniqueId = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    const outputTemplate = path.join(tempDir, `v2x_${uniqueId}.%(ext)s`);
-    
-    let finalExt = ext || 'mp4';
-    let finalPath;
-    let lastError;
-    
-    async function downloadWithRetry(attempts) {
-      for (let i = 0; i < attempts.length; i++) {
-        const args = attempts[i];
-        const attemptName = ext === 'mp3' || ext === 'wav' ? 'audio' : 'video';
-        console.log(`[DOWNLOAD] ${attemptName} attempt ${i + 1}:`, args.slice(0, 4).join(' '));
-        
-        try {
-          await execYtDlp(args, 300000);
-          
-          const tempFile = path.join(tempDir, `v2x_${uniqueId}.${finalExt}`);
-          
-          if (fs.existsSync(tempFile)) {
-            finalPath = tempFile;
-            break;
-          }
-          
-          const files = fs.readdirSync(tempDir).filter(f => f.startsWith(`v2x_${uniqueId}`));
-          if (files.length > 0) {
-            finalPath = path.join(tempDir, files[0]);
-            const extMatch = files[0].match(/\.(\w+)$/);
-            if (extMatch) finalExt = extMatch[1];
-            break;
-          }
-        } catch (err) {
-          lastError = err;
-          console.log(`[DOWNLOAD] Attempt ${i + 1} failed (${err.type}):`, err.message);
-          
-          if (err.type === 'BOT' && i < attempts.length - 1) {
-            console.log('[DOWNLOAD] Bot detected, retrying with rotated User-Agent...');
-            continue;
-          }
-          
-          if (err.type === 'FFMPEG') throw err;
+  if (!checkRateLimit(req.ip || 'unknown')) {
+    return res.status(429).json({ error: 'Too many requests' });
+  }
+  
+  const { url, formatId, ext } = req.body;
+  if (!url || !formatId || !sanitizeUrl(url)) {
+    return res.status(400).json({ error: 'Invalid request' });
+  }
+  
+  const tmp = os.tmpdir();
+  const id = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  const out = path.join(tmp, `v2x_${id}.%(ext)s`);
+  
+  let finalExt = ext || 'mp4';
+  let finalPath;
+  let lastError;
+  
+  async function download(attempts) {
+    for (let i = 0; i < attempts.length; i++) {
+      console.log('[DL] Attempt', i + 1, attempts[i].slice(0, 3).join(' '));
+      try {
+        await execYtDlp(attempts[i], 300000);
+        const f = path.join(tmp, `v2x_${id}.${finalExt}`);
+        if (fs.existsSync(f)) { finalPath = f; break; }
+        const files = fs.readdirSync(tmp).filter(f => f.startsWith(`v2x_${id}`));
+        if (files.length) {
+          finalPath = path.join(tmp, files[0]);
+          finalExt = files[0].match(/\.(\w+)$/)?.[1] || finalExt;
+          break;
         }
-      }
-      
-      if (!finalPath) {
-        throw lastError || new Error('Download failed after all attempts');
+      } catch (e) {
+        lastError = e;
+        console.log('[DL] Failed:', e.type, e.message);
+        if (e.type === 'BOT' || e.type === 'FFMPEG') throw e;
       }
     }
-    
+    if (!finalPath) throw lastError || new Error('Download failed');
+  }
+  
+  try {
     if (ext === 'mp3' || ext === 'wav') {
-      const audioFormat = ext;
-      const audioQual = formatId === '320' ? '0' : formatId === '128' ? '5' : '9';
-      const attempts = buildAudioAttempts(url, outputTemplate, audioFormat, audioQual);
-      await downloadWithRetry(attempts);
+      const qual = formatId === '320' ? '0' : formatId === '128' ? '5' : '9';
+      await download(buildAudioAttempts(url, out, ext, qual));
       finalExt = ext;
     } else {
-      const attempts = buildMp4Attempts(url, outputTemplate);
-      await downloadWithRetry(attempts);
+      await download(buildMp4Attempts(url, out));
     }
     
     const stat = fs.statSync(finalPath);
-    const filename = path.basename(finalPath);
+    console.log('[DL] Success:', path.basename(finalPath), `(${stat.size} bytes)`);
     
-    console.log(`[DOWNLOAD] Success: ${filename} (${stat.size} bytes)`);
-    
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${path.basename(finalPath)}"`);
     res.setHeader('Content-Type', 'application/octet-stream');
     
-    const readStream = fs.createReadStream(finalPath);
-    
-    readStream.on('error', (err) => {
-      console.error('[DOWNLOAD] Stream error:', err.message);
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Failed to send file' });
-      }
-    });
-    
-    res.on('close', () => {
-      try {
-        if (fs.existsSync(finalPath)) {
-          fs.unlinkSync(finalPath);
-        }
-      } catch (cleanupError) {
-        console.error('[DOWNLOAD] Cleanup error:', cleanupError.message);
-      }
-    });
-    
-    readStream.pipe(res);
-    
-  } catch (error) {
-    const err = error.type ? error : { type: 'OTHER', message: error.message };
-    console.error('[DOWNLOAD] Error:', err.message);
-    res.status(500).json({ error: err.message || 'Failed to download video' });
+    const stream = fs.createReadStream(finalPath);
+    stream.on('error', e => console.error('[DL] Stream error:', e.message));
+    res.on('close', () => { try { fs.unlinkSync(finalPath); } catch {} });
+    stream.pipe(res);
+  } catch (e) {
+    console.error('[DL] Error:', e.message);
+    res.status(500).json({ error: e.type === 'BOT' ? e.message : 'Download failed' });
   }
 });
 
-app.use((err, req, res, next) => {
+app.use((err, req, res) => {
   console.error('[SERVER] Error:', err);
-  res.status(500).json({ error: 'Internal server error' });
+  res.status(500).json({ error: 'Server error' });
 });
 
-process.on('SIGTERM', () => {
-  console.log('[SERVER] SIGTERM received, shutting down gracefully');
-  process.exit(0);
-});
+process.on('SIGTERM', () => process.exit(0));
 
-app.listen(PORT, () => {
-  console.log(`[SERVER] Running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`[SERVER] Port ${PORT}`));
