@@ -6,7 +6,20 @@ const os = require('os');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const COOKIES_PATH = path.join(__dirname, 'cookies.txt');
+const COOKIES_PATH = '/tmp/cookies.txt';
+
+function initCookies() {
+  if (process.env.COOKIES_DATA) {
+    try {
+      fs.writeFileSync(COOKIES_PATH, process.env.COOKIES_DATA, { mode: 0o600 });
+      console.log('Cookies loaded from environment');
+    } catch (err) {
+      console.error('Failed to load cookies:', err.message);
+    }
+  }
+}
+
+initCookies();
 
 app.use(express.json());
 app.use(express.static('public'));
