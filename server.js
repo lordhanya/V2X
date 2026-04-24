@@ -8,6 +8,10 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const COOKIES_PATH = '/tmp/cookies.txt';
 
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const REFERER = 'https://www.youtube.com/';
+const ORIGIN = 'https://www.youtube.com';
+
 function initCookies() {
   if (process.env.COOKIES_DATA) {
     try {
@@ -25,14 +29,29 @@ app.use(express.json());
 app.use(express.static('public'));
 
 function cookiesEnabled() {
-  return fs.existsSync(COOKIES_PATH);
+  try {
+    if (!fs.existsSync(COOKIES_PATH)) return false;
+    const stats = fs.statSync(COOKIES_PATH);
+    return stats.size > 1000;
+  } catch {
+    return false;
+  }
 }
 
 function getYtDlpArgs(baseArgs) {
+  const commonFlags = [
+    '--user-agent', USER_AGENT,
+    '--add-header', `Referer:${REFERER}`,
+    '--add-header', `Origin:${ORIGIN}`,
+    '--force-ipv4',
+    '--no-playlist',
+    '--no-warnings'
+  ];
+  
   if (cookiesEnabled()) {
-    return [...baseArgs, '--cookies', COOKIES_PATH];
+    return [...baseArgs, '--cookies', COOKIES_PATH, ...commonFlags];
   }
-  return baseArgs;
+  return [...baseArgs, ...commonFlags];
 }
 
 const requestCounts = new Map();
@@ -112,8 +131,8 @@ function execYtDlp(args, timeout = 120000) {
       } else {
         const errorMsg = stderr.trim();
         
-        if (errorMsg.includes('Sign in to confirm') || errorMsg.includes('bot') || errorMsg.includes('HTTP Error 403')) {
-          reject({ type: 'AUTH', message: 'YouTube blocked request. Add cookies for authentication.' });
+        if (errorMsg.includes('Sign in to confirm') || errorMsg.includes('bot') || errorMsg.includes('HTTP Error 403') || errorMsg.includes('blocked')) {
+          reject({ type: 'BOT', message: 'YouTube is blocking server requests. Try again later.' });
         } else if (errorMsg.includes('Requested format is not available') || errorMsg.includes('no format') || errorMsg.includes('no matching format')) {
           reject({ type: 'FORMAT', message: 'Format not available' });
         } else if (errorMsg.includes('Unable to extract') || errorMsg.includes('network') || errorMsg.includes('Connection')) {
