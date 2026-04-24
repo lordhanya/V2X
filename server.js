@@ -236,12 +236,27 @@ app.post('/api/download', async (req, res) => {
     const uniqueId = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const outputTemplate = path.join(tempDir, `v2x_${uniqueId}.%(ext)s`);
     
-    let args = [];
     let finalExt = ext || 'mp4';
+    let lastError = null;
+    
+    async function tryDownload(args, timeout) {
+      await execYtDlp(args, timeout);
+      
+      const actualFile = outputTemplate.replace('%(ext)s', finalExt);
+      
+      if (!fs.existsSync(actualFile)) {
+        const files = fs.readdirSync(tempDir).filter(f => f.startsWith(`v2x_${uniqueId}`));
+        if (files.length === 0) {
+          throw new Error('Downloaded file not found');
+        }
+        return path.join(tempDir, files[0]);
+      }
+      return actualFile;
+    }
     
     if (ext === 'mp3') {
       const audioQual = formatId === '320' ? '0' : formatId === '128' ? '5' : '9';
-      args = [
+      const args = [
         '-x',
         '--audio-format', 'mp3',
         '--audio-quality', audioQual,
@@ -252,8 +267,25 @@ app.post('/api/download', async (req, res) => {
         url
       ];
       finalExt = 'mp3';
+      
+      try {
+        var finalPath = await tryDownload(args, 300000);
+      } catch (err) {
+        lastError = err;
+        const retryArgs = [
+          '-x',
+          '--audio-format', 'mp3',
+          '--audio-quality', '0',
+          '-o', outputTemplate,
+          '--no-playlist',
+          '--no-warnings',
+          '--prefer-ffmpeg',
+          url
+        ];
+        finalPath = await tryDownload(retryArgs, 300000);
+      }
     } else if (ext === 'wav') {
-      args = [
+      const args = [
         '-x',
         '--audio-format', 'wav',
         '--audio-quality', '0',
@@ -264,19 +296,25 @@ app.post('/api/download', async (req, res) => {
         url
       ];
       finalExt = 'wav';
-    } else if (formatId === 'bestaudio' || formatId === 'best') {
-      args = [
-        '-f', 'bestaudio',
-        '-o', outputTemplate,
-        '--no-playlist',
-        '--no-warnings',
-        '--prefer-ffmpeg',
-        url
-      ];
-      finalExt = 'm4a';
+      
+      try {
+        var finalPath = await tryDownload(args, 300000);
+      } catch (err) {
+        lastError = err;
+        const retryArgs = [
+          '-x',
+          '--audio-format', 'wav',
+          '-o', outputTemplate,
+          '--no-playlist',
+          '--no-warnings',
+          '--prefer-ffmpeg',
+          url
+        ];
+        finalPath = await tryDownload(retryArgs, 300000);
+      }
     } else {
-      args = [
-        '-f', 'bestvideo+bestaudio',
+      const args = [
+        '-f', 'bestvideo+bestaudio/best',
         '--merge-output-format', 'mp4',
         '--prefer-ffmpeg',
         '-o', outputTemplate,
@@ -284,21 +322,25 @@ app.post('/api/download', async (req, res) => {
         '--no-warnings',
         url
       ];
-    }
-    
-    await execYtDlp(args, 300000);
-    
-    const actualExt = finalExt;
-    const actualFile = outputTemplate.replace('%(ext)s', actualExt);
-    
-    if (!fs.existsSync(actualFile)) {
-      const files = fs.readdirSync(tempDir).filter(f => f.startsWith(`v2x_${uniqueId}`));
-      if (files.length === 0) {
-        throw new Error('Downloaded file not found');
+      
+      try {
+        var finalPath = await tryDownload(args, 300000);
+      } catch (err) {
+        lastError = err;
+        const retryArgs = [
+          '-f', 'best',
+          '-o', outputTemplate,
+          '--no-playlist',
+          '--no-warnings',
+          url
+        ];
+        try {
+          finalPath = await tryDownload(retryArgs, 300000);
+        } catch (retryErr) {
+          finalPath = await tryDownload(['-f', 'best', '-o', outputTemplate, '--no-playlist', url], 300000);
+        }
       }
     }
-    
-    const finalPath = fs.existsSync(actualFile) ? actualFile : files[0];
     const stat = fs.statSync(finalPath);
     const filename = path.basename(finalPath);
     
