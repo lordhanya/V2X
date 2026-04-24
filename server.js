@@ -141,7 +141,12 @@ app.post('/api/info', async (req, res) => {
   
   try {
     const out = await execYtDlp(['--dump-single-json', '--no-download', '--geo-bypass', url]);
-    const info = JSON.parse(out.trim());
+    let info;
+    try {
+      info = JSON.parse(out.trim());
+    } catch {
+      return res.status(500).json({ error: 'Failed to parse video info — yt-dlp returned invalid data' });
+    }
     
     let formats = [];
     if (format === 'mp4') {
@@ -180,17 +185,32 @@ app.post('/api/info', async (req, res) => {
       formats
     });
   } catch (e) {
-    console.error('[INFO] Error:', e.message);
+    console.error('[INFO] Error:', e.message || e);
     res.status(500).json({ error: e.type === 'BOT' ? e.message : 'Failed to fetch video info' });
   }
 });
 
-function buildMp4Attempts(url, out, formatId) {
+function buildMp4Attempts(url, out, formatId, quality) {
+  const heightMap = {
+    '2160p':'2160','1440p':'1440','1080p':'1080',
+    '720p':'720','480p':'480','360p':'360','240p':'240','144p':'144'
+  };
+  const height = heightMap[quality] || heightMap[formatId] || null;
+  
+  if (height) {
+    return [
+      ['-f', `bestvideo[height=${height}]+bestaudio/best[height=${height}]/best`, '--merge-output-format', 'mp4', '--prefer-ffmpeg', '-o', out, '--geo-bypass', url],
+      ['-f', `bestvideo[height<=${height}]+bestaudio/best`, '--merge-output-format', 'mp4', '--prefer-ffmpeg', '-o', out, '--geo-bypass', url],
+      ['-f', 'bestvideo+bestaudio/best', '--merge-output-format', 'mp4', '--prefer-ffmpeg', '-o', out, '--geo-bypass', url],
+      ['-f', 'best', '--prefer-ffmpeg', '-o', out, '--geo-bypass', url]
+    ];
+  }
+  
   return [
-    ['-f', `${formatId}+bestaudio/best[ext=mp4]/best`, '--merge-output-format', 'mp4', '--prefer-ffmpeg', '-o', out, '--geo-bypass', url],
-    ['-f', 'bestvideo[ext=mp4]+bestaudio/best[ext=mp4]', '--merge-output-format', 'mp4', '--prefer-ffmpeg', '-o', out, '--geo-bypass', url],
+    ['-f', 'bestvideo+bestaudio/best', '--merge-output-format', 'mp4', '--prefer-ffmpeg', '-o', out, '--geo-bypass', url],
     ['-f', 'best[ext=mp4]/best', '--prefer-ffmpeg', '-o', out, '--geo-bypass', url],
     ['-f', 'best', '--prefer-ffmpeg', '-o', out, '--geo-bypass', url],
+    ['-f', 'bestvideo+bestaudio', '--prefer-ffmpeg', '-o', out, '--geo-bypass', url]
   ];
 }
 
@@ -207,7 +227,7 @@ app.post('/api/download', async (req, res) => {
     return res.status(429).json({ error: 'Too many requests' });
   }
   
-  const { url, formatId, ext } = req.body;
+  const { url, formatId, quality } = req.body;
   if (!url || !formatId || !sanitizeUrl(url)) {
     return res.status(400).json({ error: 'Invalid request' });
   }
@@ -216,7 +236,7 @@ app.post('/api/download', async (req, res) => {
   const id = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   const out = path.join(tmp, `v2x_${id}.%(ext)s`);
   
-  let finalExt = ext || 'mp4';
+  let finalExt = 'mp4';
   let finalPath;
   let lastError;
   
@@ -257,12 +277,13 @@ app.post('/api/download', async (req, res) => {
   }
   
   try {
+    const ext = req.body.ext || 'mp4';
     if (ext === 'mp3' || ext === 'wav') {
       const qual = formatId === '320' ? '0' : formatId === '128' ? '5' : '9';
       await download(buildAudioAttempts(url, out, ext, qual));
       finalExt = ext;
     } else {
-      await download(buildMp4Attempts(url, out, formatId));
+      await download(buildMp4Attempts(url, out, formatId, quality));
     }
     
     const stat = fs.statSync(finalPath);
@@ -276,7 +297,7 @@ app.post('/api/download', async (req, res) => {
     res.on('close', () => { try { fs.unlinkSync(finalPath); } catch {} });
     stream.pipe(res);
   } catch (e) {
-    console.error('[DL] Error:', e.message);
+    console.error('[DL] Error:', e.message || e);
 
     try {
       const leftover = fs.readdirSync(os.tmpdir()).filter(f => f.startsWith(`v2x_${id}`));

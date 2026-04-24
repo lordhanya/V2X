@@ -6,6 +6,7 @@
     videoFetched: false,
     selectedFormat: 'mp4',
     selectedQuality: null,
+    selectedQualityLabel: '',
     videoData: null,
     currentUrl: ''
   };
@@ -66,6 +67,7 @@
   function resetUI(fullReset = false) {
     state.videoFetched = false;
     state.selectedQuality = null;
+    state.selectedQualityLabel = '';
     state.videoData = null;
     state.currentUrl = '';
     
@@ -78,19 +80,10 @@
     elements.qualityOptions.innerHTML = '';
   }
 
-  async function handlePaste() {
-    try {
-      const text = await navigator.clipboard.readText();
-      elements.videoUrl.value = text;
-      hideError();
-    } catch (err) {
-      showError('Failed to paste from clipboard');
-    }
-  }
-
   function resetForNewFetch() {
     state.videoFetched = false;
     state.selectedQuality = null;
+    state.selectedQualityLabel = '';
     state.videoData = null;
     
     hideElement(elements.resultSection);
@@ -175,10 +168,10 @@
       
       const isChecked = index === 0 ? 'checked' : '';
       const filesize = fmt.filesize ? formatFileSize(fmt.filesize) : '';
-      const qualityText = fmt.quality || 'Best';
+      const qualityText = fmt.quality || 'Unknown';
       
       label.innerHTML = `
-        <input type="radio" name="quality" value="${fmt.formatId}" data-ext="${fmt.ext}" ${isChecked}>
+        <input type="radio" name="quality" value="${fmt.formatId}" data-ext="${fmt.ext}" data-quality="${fmt.quality || ''}" ${isChecked}>
         <span class="quality-option-btn">
           ${qualityText}
           ${filesize ? `<small>${filesize}</small>` : ''}
@@ -191,6 +184,7 @@
     const firstInput = elements.qualityOptions.querySelector('input');
     if (firstInput) {
       state.selectedQuality = firstInput.value;
+      state.selectedQualityLabel = firstInput.dataset.quality || '';
       state.selectedFormat = firstInput.dataset.ext || 'mp4';
       elements.downloadBtn.disabled = false;
     }
@@ -211,6 +205,7 @@
   }
 
   async function downloadVideo(url, formatId, format) {
+    state.isLoading = true;
     setButtonLoading(elements.downloadBtn, true);
     
     try {
@@ -220,7 +215,7 @@
         body: JSON.stringify({ 
           url, 
           formatId,
-          quality: state.selectedQuality,
+          quality: state.selectedQualityLabel || state.selectedQuality,
           ext: format || state.selectedFormat
         })
       });
@@ -230,32 +225,58 @@
         throw new Error(data.error || 'Download failed');
       }
       
-      const blob = await response.blob();
       const contentDisposition = response.headers.get('Content-Disposition');
-      let filename = 'video';
+      let filename = `${state.videoData?.title || 'video'}.${format || 'mp4'}`;
       if (contentDisposition) {
         const match = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
-        if (match) {
-          filename = match[1].replace(/['"]/g, '');
-        }
+        if (match) filename = match[1].replace(/['"]/g, '');
       }
-      
+
+      const reader = response.body.getReader();
+      const stream = new ReadableStream({
+        start(controller) {
+          function pump() {
+            return reader.read().then(({ done, value }) => {
+              if (done) { controller.close(); return; }
+              controller.enqueue(value);
+              return pump();
+            });
+          }
+          return pump();
+        }
+      });
+
+      const blob = await new Response(stream).blob();
       const downloadUrl = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = downloadUrl;
-      a.download = filename || `${state.videoData?.title || 'video'}.${format || 'mp4'}`;
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-      URL.revokeObjectURL(downloadUrl);
+      setTimeout(() => URL.revokeObjectURL(downloadUrl), 10000);
       
     } catch (error) {
       showError(error.message);
     } finally {
+      state.isLoading = false;
       const btnText = elements.downloadBtn.querySelector('.btn-text');
       if (btnText) btnText.textContent = 'Download';
       elements.downloadBtn.classList.remove('loading');
       elements.downloadBtn.disabled = false;
+    }
+  }
+
+  function handlePaste() {
+    try {
+      navigator.clipboard.readText().then(text => {
+        elements.videoUrl.value = text;
+        hideError();
+      }).catch(() => {
+        showError('Failed to paste from clipboard');
+      });
+    } catch {
+      showError('Failed to paste from clipboard');
     }
   }
 
@@ -274,7 +295,12 @@
       return;
     }
     
-    state.selectedFormat = document.querySelector('input[name="format"]:checked').value;
+    const checkedFormat = document.querySelector('input[name="format"]:checked');
+    if (!checkedFormat) {
+      showError('Please select a format');
+      return;
+    }
+    state.selectedFormat = checkedFormat.value;
     
     try {
       await fetchVideoInfo(url, state.selectedFormat);
@@ -292,6 +318,7 @@
   elements.qualityOptions.addEventListener('change', (e) => {
     if (e.target.name === 'quality') {
       state.selectedQuality = e.target.value;
+      state.selectedQualityLabel = e.target.dataset.quality || '';
       state.selectedFormat = e.target.dataset.ext || state.selectedFormat;
       elements.downloadBtn.disabled = false;
     }
@@ -323,6 +350,6 @@
     });
   });
 
-  elements.pasteBtn.addEventListener('click', handlePaste);
+  elements.pasteBtn?.addEventListener('click', handlePaste);
 
 })();
