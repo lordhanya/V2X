@@ -92,7 +92,7 @@ function execYtDlp(args, timeout = 120000) {
       timedOut = true;
       killed = true;
       proc.kill('SIGKILL');
-      reject(new Error('Process timed out'));
+      reject({ type: 'TIMEOUT', message: 'Process timed out' });
     }, timeout);
     
     proc.stdout.on('data', (data) => {
@@ -114,8 +114,10 @@ function execYtDlp(args, timeout = 120000) {
         
         if (errorMsg.includes('Sign in to confirm') || errorMsg.includes('bot') || errorMsg.includes('HTTP Error 403')) {
           reject({ type: 'AUTH', message: 'YouTube blocked request. Add cookies for authentication.' });
-        } else if (errorMsg.includes('Requested format is not available') || errorMsg.includes('no format')) {
+        } else if (errorMsg.includes('Requested format is not available') || errorMsg.includes('no format') || errorMsg.includes('no matching format')) {
           reject({ type: 'FORMAT', message: 'Format not available' });
+        } else if (errorMsg.includes('Unable to extract') || errorMsg.includes('network') || errorMsg.includes('Connection')) {
+          reject({ type: 'NETWORK', message: 'Network error' });
         } else if (errorMsg.includes('ffmpeg') && errorMsg.includes('not found')) {
           reject({ type: 'FFMPEG', message: 'FFmpeg not available' });
         } else if (errorMsg) {
@@ -128,7 +130,7 @@ function execYtDlp(args, timeout = 120000) {
     
     proc.on('error', (err) => {
       clearTimeout(timer);
-      reject({ type: 'OTHER', message: err.message });
+      reject({ type: 'NETWORK', message: err.message });
     });
   });
 }
@@ -156,6 +158,7 @@ app.post('/api/info', async (req, res) => {
       '--no-download',
       '--no-playlist',
       '--no-warnings',
+      '--geo-bypass',
       url
     ]);
     
@@ -164,8 +167,10 @@ app.post('/api/info', async (req, res) => {
     let formats = [];
     
     if (format === 'mp4') {
-      const videoFormats = (info.formats || []).filter(f => f.ext === 'mp4' && f.filesize && f.height);
+      const videoFormats = (info.formats || []).filter(f => f.ext === 'mp4' && f.filesize && f.height && f.vcodec !== 'none');
       const uniqueHeights = [...new Set(videoFormats.map(f => f.height))].sort((a, b) => b - a);
+      
+      console.log('[INFO] Available heights:', uniqueHeights.join(', '));
       
       formats = uniqueHeights.slice(0, 6).map(height => {
         const f = videoFormats.find(x => x.height === height);
@@ -200,6 +205,24 @@ app.post('/api/info', async (req, res) => {
   }
 });
 
+function buildMp4Attempts(url, outputPath) {
+  return [
+    ['-f', 'best[ext=mp4]/best', '--prefer-ffmpeg', '-o', outputPath, '--no-playlist', '--no-warnings', '--geo-bypass', url],
+    ['-f', 'bestvideo+bestaudio/best', '--merge-output-format', 'mp4', '--remux-video', 'mp4', '--prefer-ffmpeg', '-o', outputPath, '--no-playlist', '--no-warnings', '--geo-bypass', url],
+    ['-f', 'best', '--prefer-ffmpeg', '-o', outputPath, '--no-playlist', '--no-warnings', '--geo-bypass', url],
+    ['-f', 'bestvideo+bestaudio', '--prefer-ffmpeg', '-o', outputPath, '--no-playlist', '--no-warnings', '--geo-bypass', url]
+  ];
+}
+
+function buildAudioAttempts(url, outputPath, audioFormat, audioQual) {
+  return [
+    ['-x', '--audio-format', audioFormat, '--audio-quality', audioQual, '--prefer-ffmpeg', '-o', outputPath, '--no-playlist', '--no-warnings', '--geo-bypass', url],
+    ['-x', '--audio-format', audioFormat, '--audio-quality', '0', '--prefer-ffmpeg', '-o', outputPath, '--no-playlist', '--no-warnings', '--geo-bypass', url],
+    ['-f', 'bestaudio', '--prefer-ffmpeg', '-o', outputPath.replace('%(ext)s', 'm4a'), '--no-playlist', '--no-warnings', '--geo-bypass', url],
+    ['-f', 'best', '--prefer-ffmpeg', '-o', outputPath.replace('%(ext)s', 'm4a'), '--no-playlist', '--no-warnings', '--geo-bypass', url]
+  ];
+}
+
 app.post('/api/download', async (req, res) => {
   try {
     const clientIp = req.ip || req.connection?.remoteAddress || 'unknown';
@@ -220,6 +243,7 @@ app.post('/api/download', async (req, res) => {
     
     const tempDir = os.tmpdir();
     const uniqueId = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const outputTemplate = path.join(tempDir, `v2x_${uniqueId}.%(ext)s`);
     
     let finalExt = ext || 'mp4';
     let finalPath;
@@ -228,7 +252,8 @@ app.post('/api/download', async (req, res) => {
     async function downloadWithRetry(attempts) {
       for (let i = 0; i < attempts.length; i++) {
         const args = attempts[i];
-        console.log(`[DOWNLOAD] Attempt ${i + 1}:`, args.slice(0, 4).join(' '));
+        const attemptName = ext === 'mp3' || ext === 'wav' ? 'audio' : 'video';
+        console.log(`[DOWNLOAD] ${attemptName} attempt ${i + 1}:`, args.slice(0, 4).join(' '));
         
         try {
           await execYtDlp(args, 300000);
@@ -249,7 +274,7 @@ app.post('/api/download', async (req, res) => {
           }
         } catch (err) {
           lastError = err;
-          console.log(`[DOWNLOAD] Attempt ${i + 1} failed:`, err.message);
+          console.log(`[DOWNLOAD] Attempt ${i + 1} failed (${err.type}):`, err.message);
           
           if (err.type === 'AUTH') throw err;
           if (err.type === 'FFMPEG') throw err;
@@ -264,22 +289,11 @@ app.post('/api/download', async (req, res) => {
     if (ext === 'mp3' || ext === 'wav') {
       const audioFormat = ext;
       const audioQual = formatId === '320' ? '0' : formatId === '128' ? '5' : '9';
-      
-      const attempts = [
-        ['-x', '--audio-format', audioFormat, '--audio-quality', audioQual, '--prefer-ffmpeg', '-o', path.join(tempDir, `v2x_${uniqueId}.%(ext)s`), '--no-playlist', '--no-warnings', url],
-        ['-x', '--audio-format', audioFormat, '--audio-quality', '0', '--prefer-ffmpeg', '-o', path.join(tempDir, `v2x_${uniqueId}.%(ext)s`), '--no-playlist', '--no-warnings', url],
-        ['-f', 'bestaudio', '--prefer-ffmpeg', '-o', path.join(tempDir, `v2x_${uniqueId}.m4a`), '--no-playlist', '--no-warnings', url]
-      ];
-      
+      const attempts = buildAudioAttempts(url, outputTemplate, audioFormat, audioQual);
       await downloadWithRetry(attempts);
       finalExt = ext;
     } else {
-      const attempts = [
-        ['-f', 'bestvideo+bestaudio/best', '--merge-output-format', 'mp4', '--prefer-ffmpeg', '-o', path.join(tempDir, `v2x_${uniqueId}.%(ext)s`), '--no-playlist', '--no-warnings', url],
-        ['-f', 'best', '--prefer-ffmpeg', '-o', path.join(tempDir, `v2x_${uniqueId}.mp4`), '--no-playlist', '--no-warnings', url],
-        ['-f', 'bestvideo+bestaudio', '--prefer-ffmpeg', '-o', path.join(tempDir, `v2x_${uniqueId}.mp4`), '--no-playlist', '--no-warnings', url]
-      ];
-      
+      const attempts = buildMp4Attempts(url, outputTemplate);
       await downloadWithRetry(attempts);
     }
     
